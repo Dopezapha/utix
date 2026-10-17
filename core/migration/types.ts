@@ -81,19 +81,66 @@ export interface MigrationDefinition<TInput, TOutput = TInput> {
 
   /** Post-migration invariant checks that must all pass */
   readonly postChecks: readonly PostMigrationCheck<TOutput>[];
+
+  /** Optional checks executed after rollback to verify successful state restoration */
+  readonly rollbackChecks?: readonly RollbackVerificationCheck<TInput>[];
+}
+
+export interface RollbackVerificationCheck<T = unknown> {
+  readonly name: string;
+  readonly description: string;
+  readonly validate: (
+    restoredRecords: readonly T[],
+    preMigrationRecords?: readonly unknown[],
+    context?: MigrationContext
+  ) => PostMigrationCheckResult | Promise<PostMigrationCheckResult>;
+}
+
+export interface RollbackVerificationReport {
+  readonly verified: boolean;
+  readonly status: 'verified' | 'verification_failed' | 'unverified';
+  readonly checkResults: readonly PostMigrationCheckResult[];
+  readonly discrepancies?: readonly string[];
+  readonly restoredRecordCount: number;
+  readonly verificationDurationMs: number;
+  readonly recoveryGuidance?: string;
+}
+
+export interface DeploymentRollbackConfig {
+  readonly deploymentId: string;
+  readonly targetVersion: string;
+  readonly previousVersion: string;
+  readonly healthEndpointCheck?: () => Promise<boolean>;
+  readonly schemaVersionCheck?: () => Promise<string>;
+  readonly invariants?: readonly { name: string; check: () => Promise<boolean> }[];
+}
+
+export interface DeploymentRollbackReport {
+  readonly deploymentId: string;
+  readonly success: boolean;
+  readonly verified: boolean;
+  readonly previousVersionRestored: boolean;
+  readonly healthCheckPassed: boolean;
+  readonly invariantResults: readonly { name: string; passed: boolean }[];
+  readonly discrepancies?: readonly string[];
+  readonly recoveryNotes: string;
+  readonly timestamp: Date;
 }
 
 export interface MigrationExecutionReport<TOutput = unknown> {
   readonly migrationId: string;
   readonly success: boolean;
-  readonly status: 'applied' | 'dry_run' | 'rolled_back' | 'failed';
+  readonly status: 'applied' | 'dry_run' | 'rolled_back' | 'failed' | 'rollback_verification_failed';
   readonly totalRecords: number;
   readonly affectedRecords: number;
   readonly postCheckResults: readonly PostMigrationCheckResult[];
   readonly errors?: readonly string[];
   readonly durationMs: number;
   readonly rollbackExecuted?: boolean;
+  readonly rollbackVerification?: RollbackVerificationReport;
   readonly rollbackNotes: string;
   readonly forwardFixNotes: string;
   readonly outputRecords?: readonly TOutput[];
+  readonly rollbackOutputRecords?: readonly unknown[];
 }
+

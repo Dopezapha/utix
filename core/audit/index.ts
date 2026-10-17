@@ -29,3 +29,11 @@ export {
   type AuditTarget,
   type AuditTrail
 } from "@/core/audit/audit";
+export {
+  OperationalDataRetentionManager,
+  scrubSensitiveValue,
+  type DeletionOptions,
+  type RetentionErrorCode,
+  type RetentionPolicy,
+  type RetentionSweepResult
+} from "./retention";

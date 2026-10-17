@@ -1,3 +1,4 @@
+import { err, ok, type Result } from '@/core/result/result';
 import {
   CrossDeviceSession,
   SessionDevice,
@@ -6,11 +7,16 @@ import {
   SyncConflict,
   ConflictResolution,
   SessionConfig,
+  SecurityEvent,
+  SessionErrorCode,
+  RevocationReport,
 } from './types';
 
 class CrossDeviceSessionManager {
   private sessions: Map<string, CrossDeviceSession> = new Map();
   private stateSyncs: Map<string, StateSync[]> = new Map();
+  private revokedTokens: Set<string> = new Set();
+  private securityEvents: SecurityEvent[] = [];
 
   private defaultConfig: SessionConfig = {
     conflictStrategy: 'last-write-wins',
@@ -24,7 +30,10 @@ class CrossDeviceSessionManager {
     this.config = { ...this.defaultConfig, ...config };
   }
 
-  createSession(userId: string, device: Omit<SessionDevice, 'id' | 'active'>): CrossDeviceSession {
+  createSession(
+    userId: string,
+    device: Omit<SessionDevice, 'id' | 'active' | 'lastActivity'> & { lastActivity?: Date }
+  ): CrossDeviceSession {
     const session: CrossDeviceSession = {
       id: `session-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       userId,
@@ -34,7 +43,7 @@ class CrossDeviceSessionManager {
           ...device,
           id: `device-${Date.now()}-${Math.random().toString(36).slice(2)}`,
           active: true,
-          lastActivity: new Date(),
+          lastActivity: device.lastActivity || new Date(),
         },
       ],
       primaryDevice: '',
@@ -57,7 +66,7 @@ class CrossDeviceSessionManager {
 
   addDevice(
     sessionId: string,
-    device: Omit<SessionDevice, 'id' | 'active'>,
+    device: Omit<SessionDevice, 'id' | 'active' | 'lastActivity'> & { lastActivity?: Date },
   ): SessionDevice | null {
     const session = this.sessions.get(sessionId);
     if (!session) return null;
@@ -107,12 +116,33 @@ class CrossDeviceSessionManager {
     }
   }
 
-  syncState(sessionId: string, deviceId: string, state: Record<string, unknown>): StateSync {
+  syncState(
+    sessionId: string,
+    deviceId: string,
+    state: Record<string, unknown>,
+    syncToken?: string
+  ): StateSync {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Session ${sessionId} not found`);
 
+    if (session.revoked) {
+      throw new Error(`Session ${sessionId} has been revoked: ${session.revocationReason || 'security_event'}`);
+    }
+
+    if (this.revokedTokens.has(session.syncToken)) {
+      throw new Error(`Sync token for session ${sessionId} has been revoked`);
+    }
+
+    if (syncToken && (syncToken !== session.syncToken || this.revokedTokens.has(syncToken))) {
+      throw new Error(`Provided sync token is invalid or revoked`);
+    }
+
     const device = session.devices.find(d => d.id === deviceId);
     if (!device) throw new Error(`Device ${deviceId} not found in session`);
+
+    if (device.revoked || !device.active) {
+      throw new Error(`Device ${deviceId} is inactive or revoked`);
+    }
 
     // Calculate changes
     const changes = this.calculateChanges(session.state, state);
@@ -211,7 +241,7 @@ class CrossDeviceSessionManager {
     const syncs = this.stateSyncs.get(session.id) || [];
     if (syncs.length < 2) return conflicts;
 
-    const lastOtherSync = syncs.findLast(s => s.deviceId !== deviceId);
+    const lastOtherSync = [...syncs].reverse().find(s => s.deviceId !== deviceId);
     if (!lastOtherSync) return conflicts;
 
     for (const [key, value] of Object.entries(newState)) {
@@ -356,6 +386,251 @@ class CrossDeviceSessionManager {
     // Keep data for 30 days
     return true;
   }
+
+  revokeSession(sessionId: string, event: SecurityEvent): Result<RevocationReport, SessionErrorCode> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return err('session_not_found');
+
+    if (!event || !event.type || !event.actor) {
+      return err('invalid_security_event');
+    }
+
+    if (event.actor.role === 'user' && event.actor.id !== session.userId) {
+      return err('unauthorized');
+    }
+
+    const timestamp = event.timestamp instanceof Date ? event.timestamp : new Date();
+    session.revoked = true;
+    session.revokedAt = timestamp;
+    session.revocationReason = event.reason || event.type;
+
+    this.revokedTokens.add(session.syncToken);
+
+    const revokedDeviceIds: string[] = [];
+    for (const device of session.devices) {
+      device.active = false;
+      device.revoked = true;
+      device.revokedAt = timestamp;
+      device.revocationReason = event.reason || event.type;
+      revokedDeviceIds.push(device.id);
+    }
+
+    this.securityEvents.push(event);
+
+    return ok({
+      success: true,
+      eventType: event.type,
+      userId: session.userId,
+      revokedSessionIds: [session.id],
+      revokedDeviceIds,
+      timestamp,
+      reason: event.reason,
+    });
+  }
+
+  revokeDevice(
+    sessionId: string,
+    deviceId: string,
+    event: SecurityEvent
+  ): Result<RevocationReport, SessionErrorCode> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return err('session_not_found');
+
+    if (!event || !event.type || !event.actor) {
+      return err('invalid_security_event');
+    }
+
+    if (event.actor.role === 'user' && event.actor.id !== session.userId) {
+      return err('unauthorized');
+    }
+
+    const device = session.devices.find(d => d.id === deviceId);
+    if (!device) return err('device_not_found');
+
+    const timestamp = event.timestamp instanceof Date ? event.timestamp : new Date();
+    device.active = false;
+    device.revoked = true;
+    device.revokedAt = timestamp;
+    device.revocationReason = event.reason || event.type;
+
+    // Invalidate current sync token to disconnect compromised device
+    this.revokedTokens.add(session.syncToken);
+    session.syncToken = this.generateSyncToken();
+
+    // Re-evaluate primary device
+    const activeDevices = session.devices.filter(d => d.active && !d.revoked);
+    if (activeDevices.length === 0) {
+      session.revoked = true;
+      session.revokedAt = timestamp;
+      session.revocationReason = 'all_devices_revoked';
+    } else if (session.primaryDevice === deviceId) {
+      this.updatePrimaryDevice(session);
+    }
+
+    this.securityEvents.push(event);
+
+    return ok({
+      success: true,
+      eventType: event.type,
+      userId: session.userId,
+      revokedSessionIds: session.revoked ? [session.id] : [],
+      revokedDeviceIds: [deviceId],
+      timestamp,
+      reason: event.reason,
+    });
+  }
+
+  revokeAllUserSessions(
+    userId: string,
+    event: SecurityEvent,
+    exceptDeviceId?: string
+  ): Result<RevocationReport, SessionErrorCode> {
+    if (!userId || !event || !event.type || !event.actor) {
+      return err('invalid_security_event');
+    }
+
+    if (event.actor.role === 'user' && event.actor.id !== userId) {
+      return err('unauthorized');
+    }
+
+    const timestamp = event.timestamp instanceof Date ? event.timestamp : new Date();
+    const revokedSessionIds: string[] = [];
+    const revokedDeviceIds: string[] = [];
+
+    for (const session of this.sessions.values()) {
+      if (session.userId !== userId) continue;
+
+      if (exceptDeviceId) {
+        const hasExceptDevice = session.devices.some(d => d.id === exceptDeviceId);
+        if (hasExceptDevice) {
+          this.revokedTokens.add(session.syncToken);
+          session.syncToken = this.generateSyncToken();
+
+          for (const device of session.devices) {
+            if (device.id !== exceptDeviceId) {
+              device.active = false;
+              device.revoked = true;
+              device.revokedAt = timestamp;
+              device.revocationReason = event.reason || event.type;
+              revokedDeviceIds.push(device.id);
+            }
+          }
+          session.primaryDevice = exceptDeviceId;
+          continue;
+        }
+      }
+
+      session.revoked = true;
+      session.revokedAt = timestamp;
+      session.revocationReason = event.reason || event.type;
+      this.revokedTokens.add(session.syncToken);
+      revokedSessionIds.push(session.id);
+
+      for (const device of session.devices) {
+        device.active = false;
+        device.revoked = true;
+        device.revokedAt = timestamp;
+        device.revocationReason = event.reason || event.type;
+        revokedDeviceIds.push(device.id);
+      }
+    }
+
+    this.securityEvents.push(event);
+
+    return ok({
+      success: true,
+      eventType: event.type,
+      userId,
+      revokedSessionIds,
+      revokedDeviceIds,
+      timestamp,
+      reason: event.reason,
+    });
+  }
+
+  pruneStaleSessions(options?: {
+    staleThresholdMs?: number;
+    actor?: { id: string; role: 'user' | 'maintainer' | 'system' };
+    now?: Date;
+  }): Result<RevocationReport, SessionErrorCode> {
+    const actor = options?.actor ?? { id: 'system', role: 'system' };
+    const now = options?.now ?? new Date();
+    const thresholdMs = options?.staleThresholdMs ?? this.config.staleSessionTimeoutMs ?? 30 * 24 * 60 * 60 * 1000;
+
+    const revokedSessionIds: string[] = [];
+    const revokedDeviceIds: string[] = [];
+
+    for (const session of this.sessions.values()) {
+      if (actor.role === 'user' && session.userId !== actor.id) {
+        continue;
+      }
+
+      let allDevicesStale = true;
+      for (const device of session.devices) {
+        const idleTime = now.getTime() - device.lastActivity.getTime();
+        if (idleTime > thresholdMs && !device.revoked) {
+          device.active = false;
+          device.revoked = true;
+          device.revokedAt = now;
+          device.revocationReason = 'stale_session_timeout';
+          revokedDeviceIds.push(device.id);
+        } else if (!device.revoked && device.active) {
+          allDevicesStale = false;
+        }
+      }
+
+      if (allDevicesStale && !session.revoked) {
+        session.revoked = true;
+        session.revokedAt = now;
+        session.revocationReason = 'stale_session_timeout';
+        this.revokedTokens.add(session.syncToken);
+        revokedSessionIds.push(session.id);
+      }
+    }
+
+    return ok({
+      success: true,
+      eventType: 'stale_session_timeout',
+      userId: actor.role === 'user' ? actor.id : 'global',
+      revokedSessionIds,
+      revokedDeviceIds,
+      timestamp: now,
+      reason: `Pruned devices/sessions inactive for over ${thresholdMs}ms`,
+    });
+  }
+
+  isTokenRevoked(token: string): boolean {
+    return this.revokedTokens.has(token);
+  }
+
+  isSessionRevoked(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    return Boolean(session?.revoked);
+  }
+
+  retryRevocation(
+    fn: () => Result<RevocationReport, SessionErrorCode>,
+    maxRetries = 3
+  ): Result<RevocationReport, SessionErrorCode> {
+    let attempts = 0;
+    while (attempts <= maxRetries) {
+      attempts += 1;
+      const res = fn();
+      if (res.ok) return res;
+      if (attempts > maxRetries) {
+        return err('revocation_retries_exhausted');
+      }
+    }
+    return err('revocation_retries_exhausted');
+  }
+
+  reset(): void {
+    this.sessions.clear();
+    this.stateSyncs.clear();
+    this.revokedTokens.clear();
+    this.securityEvents = [];
+  }
 }
+
 
 export const sessionManager = new CrossDeviceSessionManager();
